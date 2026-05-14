@@ -364,7 +364,10 @@ def compute_pi_gmpy2(target_digits: int) -> str:
     than mpmath for the same precision, and uses all SIMD/AVX instructions.
     """
     import gmpy2
-    prec_bits = int(target_digits * 3.3219) + 128
+    max_prec = gmpy2.mpfr_prec_max()
+    max_digits = int((max_prec - 128) / 3.3219)
+    target_digits = min(target_digits, max_digits)
+    prec_bits = min(int(target_digits * 3.3219) + 128, max_prec)
     ctx = gmpy2.get_context()
     ctx.precision = prec_bits
     banner(f"gmpy2: {prec_bits:,}-bit Chudnovsky via libmpfr ...")
@@ -703,28 +706,28 @@ def _download_pi_file(url: str, dest: Path, is_zip: bool):
 
 def _ensure_pi_file():
     """
-    If pi.txt already exists with valid content, skip the download prompt.
-    Otherwise, ask the user to choose a size and download it.
+    If pi.txt already exists with at least as many digits as the chosen source,
+    skip the download. Otherwise download (re-download if truncated).
     """
+    chosen = _PI_SIZES[-1]  # 1 GB / ~500M digits
+
     if OUTPUT_FILE.exists():
         content = OUTPUT_FILE.read_text(encoding="utf-8").strip()
         if not content.startswith("3."):
             content = "3." + content.lstrip("3").lstrip(".")
             OUTPUT_FILE.write_text(content, encoding="utf-8")
-        if len(content) > 2:
-            banner(f"Existing pi.txt found: {len(content) - 2:,} digits — skipping download.")
+        existing_digits = len(content) - 2
+        if existing_digits >= chosen["approx_digits"] * 0.99:
+            banner(f"Existing pi.txt found: {existing_digits:,} digits — skipping download.")
+            banner(f"PI file ready: {existing_digits:,} digits.")
             return
+        banner(f"Existing pi.txt has only {existing_digits:,} digits (expected ~{chosen['approx_digits']:,}) — re-downloading.")
 
-    # No valid file — auto-select 1 GB
-    chosen = _PI_SIZES[-1]
     banner(f"Selected: {chosen['label']}")
     _download_pi_file(chosen["url"], OUTPUT_FILE, chosen["zip"])
 
-    # Quick sanity-check
     content = OUTPUT_FILE.read_text(encoding="utf-8").strip()
     if not content.startswith("3."):
-        # Some sources start directly with digits (no "3.")
-        # Normalise: prepend "3." if missing
         content = "3." + content.lstrip("3").lstrip(".")
         OUTPUT_FILE.write_text(content, encoding="utf-8")
     banner(f"PI file ready: {len(content) - 2:,} digits.")
