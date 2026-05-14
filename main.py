@@ -508,6 +508,228 @@ def compute_pi_opencl(target_digits: int, ocl, gmpy2) -> str:
         return nstr(mp.pi, target_digits, strip_zeros=False)
 
 
+# ─── Pi size options ─────────────────────────────────────────────────────────
+
+_PI_SIZES = [
+    {
+        "label":       "1 MB   (~500K digits)",
+        "approx_digits": 500_000,
+        "url":         "https://pi2e.ch/blog/wp-content/uploads/2017/03/pi_hex_1m.txt",
+        "zip":         False,
+    },
+    {
+        "label":       "10 MB  (~5M digits)",
+        "approx_digits": 5_000_000,
+        "url":         "https://files.pilookup.com/pi/10000000.txt",
+        "zip":         False,
+    },
+    {
+        "label":       "100 MB (~50M digits)",
+        "approx_digits": 50_000_000,
+        "url":         "https://files.pilookup.com/pi/9900000001-10000000000.zip",
+        "zip":         True,
+    },
+    {
+        "label":       "1 GB   (~500M digits)",
+        "approx_digits": 500_000_000,
+        "url":         "https://stuff.mit.edu/afs/sipb/contrib/pi/pi-billion.txt",
+        "zip":         False,
+    },
+]
+
+
+def _select_pi_size() -> dict:
+    """Interactively ask the user to choose a PI file size."""
+    print("\n┌─────────────────────────────────────────┐", flush=True)
+    print("│  Choose starting PI file size to download │", flush=True)
+    print("└─────────────────────────────────────────┘", flush=True)
+    for i, opt in enumerate(_PI_SIZES, 1):
+        print(f"  [{i}] {opt['label']}", flush=True)
+    print(flush=True)
+    while True:
+        try:
+            raw = input("Enter choice (1-4): ").strip()
+            idx = int(raw) - 1
+            if 0 <= idx < len(_PI_SIZES):
+                return _PI_SIZES[idx]
+        except (ValueError, EOFError):
+            pass
+        print("  Please enter a number between 1 and 4.", flush=True)
+
+
+def _fmt_size(n_bytes: float) -> str:
+    """Format bytes as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n_bytes) < 1024:
+            return f"{n_bytes:.1f} {unit}"
+        n_bytes /= 1024
+    return f"{n_bytes:.1f} TB"
+
+
+def _fmt_eta(secs: float) -> str:
+    """Format seconds as m:ss or h:mm:ss."""
+    if not (0 <= secs < 360000):  # cap at 100 hours
+        return "--:--"
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m, s   = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _progress_bar(pct: float, width: int = 30) -> str:
+    filled = int(width * pct / 100)
+    bar    = "\u2588" * filled + "\u2591" * (width - filled)
+    return f"[{bar}]"
+
+
+def _download_with_progress(url: str, dest: Path) -> None:
+    """
+    Stream-download url -> dest with a live progress line:
+      [████░░░] 42.3%  18.2 / 43.0 MB  |  3.4 MB/s  |  ETA 7:12
+    """
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "pi-downloader/1.0"})
+    with urllib.request.urlopen(req) as resp, open(dest, "wb") as out:
+        total      = int(resp.headers.get("Content-Length", 0))
+        received   = 0
+        t_start    = time.monotonic()
+        t_last     = t_start
+        spd_smooth = 0.0
+        chunk_size = 1 << 17   # 128 KB
+
+        while True:
+            chunk = resp.read(chunk_size)
+            if not chunk:
+                break
+            out.write(chunk)
+            received += len(chunk)
+
+            now    = time.monotonic()
+            dt     = max(now - t_last, 1e-6)
+            t_last = now
+            elapsed = max(now - t_start, 1e-6)
+
+            inst_spd   = len(chunk) / dt
+            spd_smooth = 0.2 * inst_spd + 0.8 * spd_smooth if spd_smooth else inst_spd
+
+            if total:
+                pct = min(received / total * 100, 100)
+                bar = _progress_bar(pct)
+                line = (
+                    f"\r  {bar} {pct:5.1f}%  "
+                    f"{_fmt_size(received)} / {_fmt_size(total)}  |  "
+                    f"{_fmt_size(spd_smooth)}/s"
+                )
+            else:
+                line = (
+                    f"\r  \u2193 {_fmt_size(received)} received  |  "
+                    f"{_fmt_size(spd_smooth)}/s  |  "
+                    f"elapsed {_fmt_eta(elapsed)}"
+                )
+            print(f"{line:<80}", end="", flush=True)
+
+    elapsed = max(time.monotonic() - t_start, 1e-6)
+    avg_spd = received / elapsed
+    print(
+        f"\r  \u2713 {_fmt_size(received)} in {_fmt_eta(elapsed)} "
+        f"(avg {_fmt_size(avg_spd)}/s){' ' * 20}",
+        flush=True
+    )
+
+
+def _download_pi_file(url: str, dest: Path, is_zip: bool):
+    """Download (and optionally unzip) a PI file to dest."""
+    import zipfile
+    import tempfile
+
+    banner(f"Source : {url}")
+    banner(f"Target : {dest}")
+
+    if is_zip:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        banner("Downloading ZIP ...")
+        _download_with_progress(url, tmp_path)
+
+        banner("Extracting ZIP ...")
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            names = [n for n in zf.namelist() if not n.endswith("/")]
+            if not names:
+                print("ERROR: ZIP archive is empty.", flush=True)
+                sys.exit(1)
+            largest = max(names, key=lambda n: zf.getinfo(n).file_size)
+            info    = zf.getinfo(largest)
+            banner(f"Extracting {largest}  ({_fmt_size(info.file_size)}) ...")
+
+            extracted = 0
+            t_start   = time.monotonic()
+            with zf.open(largest) as src, open(dest, "wb") as dst:
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    extracted += len(chunk)
+                    elapsed = max(time.monotonic() - t_start, 1e-6)
+                    spd  = extracted / elapsed
+                    if info.file_size:
+                        pct  = min(extracted / info.file_size * 100, 100)
+                        bar  = _progress_bar(pct)
+                        line = (
+                            f"\r  {bar} {pct:5.1f}%  "
+                            f"{_fmt_size(extracted)} / {_fmt_size(info.file_size)}  |  "
+                            f"{_fmt_size(spd)}/s"
+                        )
+                    else:
+                        line = f"\r  \u2193 {_fmt_size(extracted)}  |  {_fmt_size(spd)}/s"
+                    print(f"{line:<80}", end="", flush=True)
+            elapsed = max(time.monotonic() - t_start, 1e-6)
+            print(
+                f"\r  \u2713 Extracted {_fmt_size(extracted)} in {_fmt_eta(elapsed)}"
+                f"{' ' * 30}",
+                flush=True
+            )
+        tmp_path.unlink(missing_ok=True)
+    else:
+        banner("Downloading ...")
+        _download_with_progress(url, dest)
+
+    banner(f"Saved \u2192 {dest}")
+
+
+def _ensure_pi_file():
+    """
+    If pi.txt already exists with valid content, skip the download prompt.
+    Otherwise, ask the user to choose a size and download it.
+    """
+    if OUTPUT_FILE.exists():
+        content = OUTPUT_FILE.read_text(encoding="utf-8").strip()
+        if not content.startswith("3."):
+            content = "3." + content.lstrip("3").lstrip(".")
+            OUTPUT_FILE.write_text(content, encoding="utf-8")
+        if len(content) > 2:
+            banner(f"Existing pi.txt found: {len(content) - 2:,} digits — skipping download.")
+            return
+
+    # No valid file — auto-select 1 GB
+    chosen = _PI_SIZES[-1]
+    banner(f"Selected: {chosen['label']}")
+    _download_pi_file(chosen["url"], OUTPUT_FILE, chosen["zip"])
+
+    # Quick sanity-check
+    content = OUTPUT_FILE.read_text(encoding="utf-8").strip()
+    if not content.startswith("3."):
+        # Some sources start directly with digits (no "3.")
+        # Normalise: prepend "3." if missing
+        content = "3." + content.lstrip("3").lstrip(".")
+        OUTPUT_FILE.write_text(content, encoding="utf-8")
+    banner(f"PI file ready: {len(content) - 2:,} digits.")
+
+
 # ─── I/O ─────────────────────────────────────────────────────────────────────
 
 def load_pi_from_file() -> str:
@@ -516,7 +738,7 @@ def load_pi_from_file() -> str:
         if content.startswith("3.") and len(content) > 2:
             banner(f"Loaded {len(content) - 2:,} existing digits from {OUTPUT_FILE}")
             return content
-    print(f"ERROR: {OUTPUT_FILE} not found or invalid. Place pi.txt next to this script.", flush=True)
+    print(f"ERROR: {OUTPUT_FILE} not found or invalid.", flush=True)
     sys.exit(1)
 
 
@@ -648,6 +870,8 @@ def main():
     banner("=" * 60)
     banner("compute_pi.py — Adaptive high-performance π computation")
     banner("=" * 60)
+
+    _ensure_pi_file()
 
     gpu_info  = detect_gpu()
     resources = detect_resources(gpu_info)
